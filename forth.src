@@ -1,0 +1,284 @@
+: \ 10 parse 2drop ; immediate
+create crlf 13 c, 10 c,
+: nl crlf 2 type ;
+: sp 32 emit ;
+: error2 ( n--) ?dup if decimal <# 32 hold dup abs #s swap sign #> type error then ;
+: errors [ ' interpret literal ] catch error2 bye ;
+errors
+
+
+
+\ ******** compiler extension
+
+: true -1 ;
+: noop ;
+: negate ( n -- -n) 0 swap - ;
+: ['] ( s"word"--xt) ' postpone literal ; immediate
+: >body ( xt--dfa) cell+ @ ;
+: from ( s"name"--n) word find >cfa cell+ @
+    state @ if postpone literal postpone @ exit then @ ; immediate
+: parse" ( --au) 34 parse ;
+\ : chomp ( au--) over + begin 1- dup c@ 32 > until over - 1+ ; \ !!u=0
+: [error]" ( n--) 34 parse rot if type bye else 2drop then ;
+: hex 16 base ! ;
+: decimal 10 base ! ;
+: h# ( s"nnn"--n) base @ word hex number rot base ! throw ; immediate
+: 2@ ( addr--h l) dup cell+ @ swap @ ;
+: 2! ( h l addr--) tuck ! cell+ ! ;
+: -- ( off size "name"--off2) create over , + does> @ + ;
+: >list ( item list--) 2dup @ swap ! ! ;
+: do-list ( list xt--) >r begin dup @ while r@ over @ >r execute r> repeat rdrop drop ;
+: scan-list ( list xt--p|end) >r begin dup @ 0= if rdrop exit then
+    r@ over >r execute if r> rdrop exit then r> @ again ;
+\ scan-list-xt ( p--end?)
+: eval-with ( au xt--) [ ' interpret >body literal ] @ >r to interpret
+    evaluate r> to interpret ;
+2358 value seed
+: rnd ( --n) seed [ h# 8088405 literal ] * 1+ dup to seed ;
+
+create buffer 4096 allot
+: file-stream ( file xt--) stdin >r
+   tib /tib 2>r >in source-id @ 2>r
+   buffer dup to tib dup to /tib to >in swap source-id !
+   catch
+   2r> source-id ! to >in 2r> to /tib to tib
+   r> to stdin throw ;
+
+: daddr ( addr--) <# # # # # # # # # #> type sp ;
+: dbyte ( i addr--) c@ dup <# # # #> type sp dup 32 < if drop 46 then
+  swap here + c! ;
+: dbytes ( addr--) 16 0 do i over dbyte 1+ loop drop ;
+: dump ( addr n--) base @ >r hex over + swap do
+  i daddr i dbytes here 16 type nl 16 +loop r> base ! ;
+
+\ forth stdcall: arguments on stack in reverse order
+create lastdll 0 ,
+: windll ( s:"file var"--) word drop LoadLibrary dup 0= throw
+   create dup , lastdll !
+   does> @ lastdll ! ;
+: winaddr ( au0--addr) drop lastdll @ GetProcAddress ;
+: winapi ( s:"proc var"--) word winaddr dup 0= throw create ,
+   does> @ stdcall ;
+
+windll kernel32 kernel32
+winapi Sleep Sleep ( ms--x)
+: sleep ( ms--) Sleep drop ;
+
+windll user32 user32
+winapi MessageBoxA msgbox  ( type cap text hparent--ret)
+
+
+
+\ ******** debug
+
+: !! ; \ mark temporary changes
+: depth ( --n) s0 @ dsp@ cell+ - cell / ;
+: rdepth ( --n) r0 rsp@ cell+ - cell / ;
+: .st4 base @ >r hex 2over swap . sp . sp over . sp dup . sp r> base ! ;
+: .rst4 base @ hex r> 2r> 2r> 2dup 2>r swap . sp . sp
+    2dup 2>r swap . sp . sp >r base ! ;
+wordlist dup constant tracing also definitions
+create tstack 64 cells allot
+here value tptr
+: >t ( n--) tptr cell - dup to tptr ! ;
+: t> ( --n) tptr dup cell+ to tptr @ ;
+: t@ ( --n) tptr @ ;
+: tmsg1 nl qs "[" type depth . 58 emit sp .st4 sp 2r> r> rdepth . 58 emit .rst4 >r 2>r ;
+: tmsg2 qs "] " type ;
+: tmsga ( adr--) >r tmsg1 r> dup 1+ swap c@ f_lenmask and type tmsg2 ;
+: tmsgb ( adr--) >r tmsg1 r> 59 emit dup 1+ swap c@ f_lenmask and type tmsg2 ;
+: exit t@ postpone literal postpone tmsgb postpone exit ; immediate
+: ; t> postpone literal postpone tmsgb postpone ; ; immediate
+: : code-here cell+ dup >t : postpone literal postpone tmsga
+[ previous ] ; definitions
+: trace tracing also ;
+: untrace previous ;
+
+
+
+\ ******** memory allocation
+
+kernel32 parse" GetProcessHeap" winaddr stdcall dup 0= throw value mainheap
+winapi HeapAlloc HeapAlloc ( bytes flags hheap--addr|0)
+winapi HeapFree HeapFree ( addr flags hheap--ok)
+winapi HeapReAlloc HeapReAlloc ( bytes addr flags hheap--addr2|0)
+: allocate ( n--addr err) 0 mainheap HeapAlloc dup 0= ;
+: free ( addr--err) 0 mainheap HeapFree 0= ;
+: reallocate ( addr n--addr2 err) swap 0 mainheap HeapReAlloc dup 0= ;
+
+
+
+\ ******** socket api
+
+windll Ws2_32 winsock2
+winapi WSAStartup WSAStartup  ( wsadata version--err)
+winapi WSACleanup WSACleanup  ( --err)
+winapi getaddrinfo getaddrinfo ( result hints service node--err)
+winapi freeaddrinfo freeaddrinfo ( addrinfo--void)
+winapi socket socket ( proto type af--h|-1)
+winapi connect connect ( len sockaddr socket--err)
+winapi send send ( flags len buf socket--n|-1)
+winapi recv recv ( flags len buf socket--n|-1)
+winapi closesocket closesocket ( h--err)
+
+: htons ( whwl--wlwh) dup 255 and 8 lshift swap 8 rshift or ;
+: htonl ( b3b2b1b0--b0b1b2b3) dup 65535 and htons 16 lshift
+ swap 16 rshift htons or ;
+-1 constant socket_error ( =invalid_socket)
+2 constant af_inet
+1 constant sock_stream
+6 constant ipproto_tcp
+
+
+
+\ ******** network lib
+
+: network here 514 WSAStartup throw ;
+: end-network WSACleanup drop ;
+
+
+
+\ ******** connect to server
+
+create ai-hints		\ struct addrinfo
+here 0 , af_inet , sock_stream , ipproto_tcp , 0 , 0 , 0 , 0 ,
+
+variable ai-list
+-1 value hsocket
+
+: ai-addr ( ai--addr n) dup 24 + @ swap 16 + @ ;
+: new-socket ipproto_tcp sock_stream af_inet socket to hsocket
+    dup socket_error = throw ;
+
+ : addr ( zname zport--) ai-list ai-hints 2swap swap getaddrinfo throw ;
+  : msg qs /Connecting to server.../ type nl ;
+ : connect-socket ( --e) new-socket msg ai-list @ ai-addr swap hsocket connect ;
+ : free-ai-list ai-list @ freeaddrinfo drop ;
+: connect-server ( zname zport--) addr connect-socket free-ai-list throw ;
+: disconnect-server hsocket closesocket drop ;
+
+
+
+\ ******** request page
+
+create name 2 cells allot
+: >server-name ( au--) name 2! ;
+: server-name ( --au) name 2@ ;
+create hdr 1024 allot
+0 value #hdr
+: +hdr ( au--) hdr #hdr + swap dup +to #hdr bmove ;
+: request ( au--) 0 to #hdr qs "GET " +hdr +hdr
+    qs " HTTP/1.1" +hdr crlf 2 +hdr
+    qs /Host: / +hdr name 2@ +hdr crlf 2 +hdr
+\    qs /Accept-Encoding: identity/ +hdr crlf 2 +hdr
+    crlf 2 +hdr 0 hdr #hdr qs /Request: / type 2dup type
+    swap hsocket send 0< throw ;
+
+
+
+\ ******** socket read
+
+4096 constant bufsize
+create buffer bufsize allot
+: empty /tib to >in ;
+ : resize ( n--) tib + to /tib buffer to >in ;
+: srefill ( --n) empty begin 0 bufsize buffer hsocket recv ?dup until
+    dup 0< throw dup resize ;
+
+: socket-read ( xt--) from refill >r ['] srefill to refill
+   tib /tib 2>r >in source-id @ 2>r
+   buffer dup to tib dup to /tib to >in hsocket source-id !
+   catch
+   2r> source-id ! to >in 2r> to /tib to tib
+   r> to refill throw ;
+
+
+
+\ ******** http counted read
+
+0 value old-refill
+0 value http-count
+0 value /received
+: 0refill ( --0) /tib to >in 0 ;
+: isolate-buffer ( n--) >in + to /tib ;
+: unhide-buffer ( --) /received to /tib ;
+    : last-part ( --n) ['] 0refill to refill http-count dup isolate-buffer ;
+   : part-size ( n--m) dup http-count >= if drop last-part then ;
+  : accept-buffer ( n--m) /tib to /received part-size dup negate +to http-count ;
+ : count-refill ( --n) old-refill execute accept-buffer ;
+: counted-http ( n xt--) old-refill >r from refill to old-refill
+    ['] count-refill to refill
+    swap to http-count /tib >in - accept-buffer drop catch
+    old-refill to refill r> to old-refill unhide-buffer throw ;
+
+
+
+\ ******** http chunked read
+
+0 value chunk-size
+create chunk-line 16 allot
+  : last-part ( --n) /tib to /received chunk-size dup isolate-buffer ;
+ : last-check ( n--m) dup chunk-size >= if drop last-part then ;
+: next-part ( --n) /tib >in - last-check dup negate +to chunk-size ;
+
+   : getline ( --au) chunk-line 16 10 parse-to 1- ;
+   : parse-size ( --n) getline  base @ >r hex number r> base ! throw ;
+   : ?skip ( n--) if getline 2drop then ;
+  : chunk-init ( notfirst--) ?skip parse-size dup to chunk-size 0= ?skip ;
+ : new-chunk ( notfirst--n) from refill >r ['] srefill to refill
+     ['] chunk-init catch r>
+     chunk-size 0= if drop ['] 0refill then to refill throw
+     next-part ;
+: next-chunk ( --n) unhide-buffer 1 new-chunk ;
+
+ : part srefill drop next-part ;
+ : chunk ( --) empty next-chunk ;
+: chunk-refill ( --n) chunk-size if part exit then chunk ;
+: chunked-http ( xt--) 0 new-chunk drop
+    from refill >r ['] chunk-refill to refill catch r> to refill throw ;
+
+
+
+\ ******** http read header
+: strbuf ( size s"name"--) create cell , allot ;
+ : stralloc ( n buf--addr) dup dup @ + -rot +! ;
+: >strbuf ( au buf--a2u) over >r stralloc tuck r@ bmove r> ;
+: 0>strbuf ( buf--) cell swap ! ;
+
+4096 strbuf values
+: hvar ( s"name"--) create [ 2 cells ] literal allot ;
+: hblank ( addr--) 0 over cell+ ! here swap ! ;
+hvar HTTP/1.1
+hvar Content-Type:
+hvar Content-Length:
+hvar Transfer-Encoding:
+hvar Accept-Ranges:
+
+: hvar@ ( addr--au) dup @ swap cell+ @ ;
+: blank HTTP/1.1 hblank Content-Length: hblank Transfer-Encoding: hblank
+    values 0>strbuf ;
+  : copy ( adr s"value\n"--) dup 0 parse values >strbuf
+      rot cell+ ! swap ! ;
+ : check ( au--) find ?dup if >cfa >body copy exit then 10 parse 2drop ;
+: read-line ( s"hvar ...") word dup if check exit then 2drop ;
+
+1024 constant #linebuf
+create linebuf #linebuf allot
+ : get-line ( --au) linebuf 10 parse 1- tuck linebuf swap bmove ;
+ : eval-line ( au--) 2dup type nl from interpret >r ['] read-line to interpret
+     ['] evaluate catch r> to interpret throw ;
+: msg qs /[answer header]/ type nl ;
+: read-header msg blank begin get-line dup while eval-line repeat 2drop ;
+
+
+
+\ ******** http read content
+
+: read-encoded ( xt--) read-header
+    Transfer-Encoding: hvar@ qs /chunked/ compare 0= if chunked-http
+    else Content-Length: hvar@ number throw swap counted-http then ;
+: read-content ( xt--) ['] read-encoded socket-read ;
+
+
+nl parse" [programm completed]" type nl
+
